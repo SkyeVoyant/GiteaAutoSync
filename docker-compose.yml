@@ -1,0 +1,18 @@
+version: "3.9"
+services:
+  autosync:
+    build: .
+    environment:
+      GITEA_BASE_URL: ${GITEA_BASE_URL:-https://gitea.example.com}
+      GITEA_OWNER: ${GITEA_OWNER:-gitea-user}
+      GITEA_TOKEN: ${GITEA_TOKEN:-replace-me}
+      PROJECTS_ROOT: /data/projects
+      SYNC_INTERVAL_MINUTES: ${SYNC_INTERVAL_MINUTES:-0}
+      SYNC_DEBOUNCE_MS: ${SYNC_DEBOUNCE_MS:-5000}
+      IGNORE_CONFIG_PATH: ${IGNORE_CONFIG_PATH:-/app/ignoreconfig.json}
+    volumes:
+      - ./projects:/data/projects:ro
+    restart: unless-stopped
+    # Uncomment to observe logs locally
+    # tty: true
+    # stdin_open: true

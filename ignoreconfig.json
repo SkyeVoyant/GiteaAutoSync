@@ -1,0 +1,25 @@
+{
+  "patterns": [
+    "node_modules/",
+    "dist/",
+    "build/",
+    "logs/",
+    "tmp/",
+    "backup/",
+    "cache/",
+    ".cache/",
+    "coverage/",
+    "data/",
+    ".env",
+    "*.log",
+    "*.tmp",
+    "*.sqlite",
+    "*.db",
+    "*.tar",
+    "*.zip",
+    "*.tgz",
+    "*.gz",
+    "__pycache__/",
+    ".DS_Store"
+  ]
+}
