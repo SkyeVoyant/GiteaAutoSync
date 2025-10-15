@@ -1,9 +1,11 @@
-# Gitea Autosync
+# Gitea Autosync (Open Source)
 
 Continuously mirror a directory of projects into any self-hosted Gitea instance.  
 Each subdirectory is treated as a Git repository; the tool initialises Git if needed, ensures the repository exists on Gitea, commits the working tree, and pushes the result.
 
 ## Setup
+
+Licensed under the GNU General Public License v2.0. See the [LICENSE](./LICENSE) file for details.
 
 1. **Generate a personal access token** (scopes: `write:user`, `write:repository`) for the Gitea account that will own the mirrored repositories.
 2. **Copy the environment template** and fill in the token and base URL:
