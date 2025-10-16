@@ -1,91 +1,75 @@
 # Gitea Autosync (Open Source)
 
-Continuously mirror a directory of projects into any self-hosted Gitea instance.  
-Each subdirectory is treated as a Git repository; the tool initialises Git if needed, ensures the repository exists on Gitea, commits the working tree, and pushes the result.
+Continuously mirror local project folders into any self-hosted Gitea instance.  
+Unofficial helper: not affiliated with the Gitea project.
 
-## Setup
+Keeps each top-level folder in sync with a private repo, auto-initialises Git, commits on change, and pushes via the Gitea API. Designed to be lightweight: set it once, let it handle scheduled and real-time snapshots.
 
-Licensed under the GNU General Public License v2.0. See the [LICENSE](./LICENSE) file for details.
+## Features
+- Auto-discovers non-hidden directories under your project roots
+- Creates or reuses repos on Gitea and seeds them with a sensible `.gitignore`
+- Watches for filesystem changes and ships “quick sync” commits within seconds
+- Strips nested `.git/` folders and adds a dedicated `gitea` remote per project
+- Optional maintenance: scheduled full syncs and Git history pruning
 
-1. **Generate a personal access token** (scopes: `write:user`, `write:repository`) for the Gitea account that will own the mirrored repositories.
-2. **Copy the environment template** and fill in the token and base URL:
-   ```bash
-   cd /path/to/projects/giteaautosync
-   cp .env.example .env
-   ```
-   Recommended values:
-   ```dotenv
-   GITEA_BASE_URL=https://gitea.example.com
-   GITEA_OWNER=<username>
-   GITEA_TOKEN=<your token>
-  PROJECTS_ROOT=/path/to/projects
-  PROJECTS_ADDITIONAL_ROOTS=/path/to/projects_archive
-  SYNC_INTERVAL_MINUTES=0
-  SYNC_DEBOUNCE_MS=5000
-  PRUNE_AGE_DAYS=0
-   ```
-4. **Install dependencies once**:
-   ```bash
-   npm install
-   ```
+## Prerequisites
+- Node.js 18+ and Git
+- Gitea personal access token (`write:user`, `write:repository`)
+- Read access to the directories you want mirrored (e.g. `/projects`, `/projects_archive`)
 
-## Usage
-
-- **Run a single sync pass:**
-  ```bash
-  npm start
-  ```
-- **Run continuously:** set `SYNC_INTERVAL_MINUTES` in `.env` to the desired interval (e.g. `15`), then start watch mode:
-  ```bash
-  npm run start:watch
-  ```
-
-The script will:
-- Skip hidden folders and create `<owner>/<folder-name>` repos on the target Gitea server.
-- Auto-create `.gitignore` files (ignoring `node_modules`, `backup`, builds, logs, etc.).
-- Strip nested `.git` directories so everything is pushed as flat content.
-- Auto-stage, commit (`Auto backup <timestamp>`), and push each project. Existing history on Gitea is force-updated when the local tree is rebuilt.
-
-## Tips
-
-- Secrets belong in `.env` (which is git-ignored). Rotate tokens regularly if the repository is public.
-- `npm start` performs a one-off backup; run it from cron/systemd if you prefer scheduled snapshots.
-- `npm run start:watch` watches the filesystem and only syncs the project that changed. Adjust `SYNC_DEBOUNCE_MS` if you need faster or slower reactions. Small edits are pushed immediately, followed by a background full-project reconciliation.
-- Extend `.gitignore` if your projects emit additional cache/build folders that you do not want mirrored.
-- Mirror multiple directories by setting `PROJECTS_ADDITIONAL_ROOTS` to a comma-separated list (e.g. `/projects_archive,/external/projects`). If not provided, the tool automatically includes a sibling `projects_archive` directory when it exists.
-- Customize `ignoreconfig.json` (or set `IGNORE_CONFIG_PATH`) to control which patterns are added to new repositories’ `.gitignore` files.
-- Set `GIT_AUTHOR_NAME` / `GIT_AUTHOR_EMAIL` if you want mirrored commits to carry your own identity (use an address verified with your Git host to show your avatar).
-- Use `PRUNE_AGE_DAYS` to run `git gc` automatically after each full sync; set to `0` to disable pruning.
-
-### Optional: Kubernetes deployment
-
-The sample manifest under `k3s/giteaautosync` expects an SSH deploy key secret so the pod can clone this repository. Create the secret manually (do **not** commit the key) before applying the manifests:
-
+## Quick start
+1) Get the code and configure
 ```bash
-ssh-keyscan github.com > github_known_hosts
-kubectl create secret generic default-github-ssh \
-  --namespace default \
-  --from-file=id_rsa=/path/to/github_deploy_key \
-  --from-file=known_hosts=github_known_hosts
+git clone https://github.com/SkyeVoyant/GiteaAutoSync.git
+cd GiteaAutoSync
+npm install
+cp .env.example .env
+```
+Set `GITEA_BASE_URL`, `GITEA_OWNER`, `GITEA_TOKEN`, and point `PROJECTS_ROOT` (and optional `PROJECTS_ADDITIONAL_ROOTS`) at your directories.
+
+2) Run once or watch continuously
+```bash
+# One-off snapshot
+npm run start
+
+# Watch mode (add SYNC_INTERVAL_MINUTES in .env for periodic full sweeps)
+npm run start:watch
 ```
 
-Use a deploy key or dedicated machine account with read access to the repository you are cloning.
+## `.env` options
+- `GITEA_BASE_URL`: your instance URL (trailing slashes trimmed)
+- `GITEA_TOKEN`: personal access token used for API + Git
+- `GITEA_OWNER`: user/org that will own mirrored repositories
+- `PROJECTS_ROOT`: primary directory; each subfolder becomes a repo
+- `PROJECTS_ADDITIONAL_ROOTS`: comma-separated extras; sibling `projects_archive` auto-added when present
+- `SYNC_INTERVAL_MINUTES`: schedule full syncs (0 to disable)
+- `SYNC_DEBOUNCE_MS`: delay before batching watch events (default 5000)
+- `IGNORE_CONFIG_PATH`: JSON file with default `.gitignore` patterns
+- `PRUNE_AGE_DAYS`: enable Git garbage collection after full syncs
+- `GIT_AUTHOR_NAME` / `GIT_AUTHOR_EMAIL`: override commit identity
 
-### Optional: Docker deployment
+## Usage notes
+- Default ignore patterns live in `ignoreconfig.json`; add your own or point `IGNORE_CONFIG_PATH` elsewhere.
+- Quick sync commits use descriptive timestamps; background full syncs reconcile everything.
+- Hidden directories are skipped automatically. Nested Git repos are flattened so only top-level folders push.
 
-Build and run with Docker Compose:
-
+## Docker Compose
+Lightweight compose stack included:
 ```bash
-docker compose up -d
-```
-
-By default the compose file expects a `projects/` directory alongside the source tree. You can override environment values at runtime:
-
-```bash
-GITEA_BASE_URL=https://gitea.example.com \
-GITEA_OWNER=my-user \
-GITEA_TOKEN=$(cat token.txt) \
 docker compose up -d --build
 ```
+Mount additional project paths and override any environment variable in `.env` or inline when you start the stack.
 
-The container launches `npm run start:watch`, so it reacts to file changes immediately.
+## Kubernetes (Kustomize)
+`deploy/base` contains a minimal Deployment that installs Git, clones this repo, and runs watch mode. Provide:
+- ConfigMap/Secret (`giteaautosync-config` / `giteaautosync-secret`) with the same variables as `.env`
+- Secret `default-github-ssh` holding a deploy key plus `known_hosts`
+- Volumes for your project directories (update host paths or swap for PVCs)
+
+## Troubleshooting
+- Missing token? The script exits with a helpful error. Double-check `.env`.
+- Conflicts? Autosync fetches/rebases before pushing; check logs if a repo still fails.
+- Slow builds? Raise `SYNC_DEBOUNCE_MS` to avoid repeated commits during large operations.
+
+## License
+GPL-2.0-only — see `LICENSE`.
