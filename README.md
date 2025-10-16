@@ -19,6 +19,7 @@ Licensed under the GNU General Public License v2.0. See the [LICENSE](./LICENSE)
    GITEA_OWNER=<username>
    GITEA_TOKEN=<your token>
    PROJECTS_ROOT=/path/to/projects
+   PROJECTS_ADDITIONAL_ROOTS=/path/to/projects_archive
    SYNC_INTERVAL_MINUTES=0
    SYNC_DEBOUNCE_MS=5000
    ```
@@ -50,6 +51,7 @@ The script will:
 - `npm start` performs a one-off backup; run it from cron/systemd if you prefer scheduled snapshots.
 - `npm run start:watch` watches the filesystem and only syncs the project that changed. Adjust `SYNC_DEBOUNCE_MS` if you need faster or slower reactions. Small edits are pushed immediately, followed by a background full-project reconciliation.
 - Extend `.gitignore` if your projects emit additional cache/build folders that you do not want mirrored.
+- Mirror multiple directories by setting `PROJECTS_ADDITIONAL_ROOTS` to a comma-separated list (e.g. `/projects_archive,/external/projects`). If not provided, the tool automatically includes a sibling `projects_archive` directory when it exists.
 - Customize `ignoreconfig.json` (or set `IGNORE_CONFIG_PATH`) to control which patterns are added to new repositories’ `.gitignore` files.
 - Set `GIT_AUTHOR_NAME` / `GIT_AUTHOR_EMAIL` if you want mirrored commits to carry your own identity (use an address verified with your Git host to show your avatar).
 

@@ -5,6 +5,7 @@ require('dotenv').config();
 const axios = require('axios').default;
 const chokidar = require('chokidar');
 const fs = require('fs/promises');
+const fsSync = require('fs');
 const path = require('path');
 const os = require('os');
 const { execFile } = require('child_process');
@@ -43,14 +44,20 @@ const DEFAULT_IGNORE_CONFIG_PATH = process.env.IGNORE_CONFIG_PATH
 let cachedIgnorePatterns = null;
 let ignoreDirectorySegments = new Set(['.git']);
 
+const PRIMARY_PROJECT_ROOT = resolveProjectsRoot();
+const ADDITIONAL_PROJECT_ROOTS = resolveAdditionalProjectRoots(PRIMARY_PROJECT_ROOT);
+
 const CONFIG = {
   baseUrl: getBaseUrl(),
   token: process.env.GITEA_TOKEN,
   owner: process.env.GITEA_OWNER || 'autosync',
-  projectsRoot: resolveProjectsRoot(),
+  projectsRoot: PRIMARY_PROJECT_ROOT,
+  additionalProjectRoots: ADDITIONAL_PROJECT_ROOTS,
   syncIntervalMinutes: Number(process.env.SYNC_INTERVAL_MINUTES || '0'),
   debounceMs: Number(process.env.SYNC_DEBOUNCE_MS || '5000')
 };
+
+CONFIG.projectRoots = Array.from(new Set([CONFIG.projectsRoot, ...CONFIG.additionalProjectRoots]));
 
 const API = axios.create({
   baseURL: `${CONFIG.baseUrl}/api/v1`,
@@ -81,10 +88,31 @@ function resolveProjectsRoot() {
   return path.resolve(value);
 }
 
+function resolveAdditionalProjectRoots(primaryRoot) {
+  const roots = new Set();
+  const envValue = process.env.PROJECTS_ADDITIONAL_ROOTS || '';
+  if (envValue.trim().length > 0) {
+    envValue
+      .split(',')
+      .map((entry) => entry.trim())
+      .filter(Boolean)
+      .forEach((entry) => {
+        roots.add(path.resolve(entry));
+      });
+  } else {
+    const archiveCandidate = path.resolve(primaryRoot, '..', 'projects_archive');
+    if (archiveCandidate !== primaryRoot && fsSync.existsSync(archiveCandidate)) {
+      roots.add(archiveCandidate);
+    }
+  }
+  return Array.from(roots).filter((root) => root !== primaryRoot);
+}
+
 async function main() {
   validateConfig();
   await ensureAskPassScript();
   await getIgnorePatterns();
+  await ensureProjectRootsExist();
 
   const args = process.argv.slice(2);
   const watchMode = args.includes('--watch');
@@ -136,6 +164,16 @@ function validateConfig() {
   }
 }
 
+async function ensureProjectRootsExist() {
+  for (const root of CONFIG.projectRoots) {
+    try {
+      await fs.mkdir(root, { recursive: true });
+    } catch (error) {
+      console.error(`Failed to ensure project root ${root}: ${error.message}`);
+    }
+  }
+}
+
 async function ensureAskPassScript() {
   const script = `#!/bin/sh
 case "$1" in
@@ -147,7 +185,15 @@ esac
 }
 
 async function discoverProjectDirectories(rootDir) {
-  const entries = await fs.readdir(rootDir, { withFileTypes: true });
+  let entries;
+  try {
+    entries = await fs.readdir(rootDir, { withFileTypes: true });
+  } catch (error) {
+    if (error.code === 'ENOENT') {
+      return [];
+    }
+    throw error;
+  }
   return entries
     .filter((entry) => entry.isDirectory() && !entry.name.startsWith('.'))
     .map((entry) => path.join(rootDir, entry.name));
@@ -159,11 +205,13 @@ async function runFullSync() {
   }
 
   fullSyncPromise = (async () => {
-    const projectDirs = await discoverProjectDirectories(CONFIG.projectsRoot);
-    for (const projectPath of projectDirs) {
-      await syncProject(projectPath).catch((error) => {
-        console.error(`[${path.basename(projectPath)}] ERROR: ${error.message}`);
-      });
+    for (const rootDir of CONFIG.projectRoots) {
+      const projectDirs = await discoverProjectDirectories(rootDir);
+      for (const projectPath of projectDirs) {
+        await syncProject(projectPath).catch((error) => {
+          console.error(`[${path.basename(projectPath)}] ERROR: ${error.message}`);
+        });
+      }
     }
   })();
 
@@ -175,12 +223,14 @@ async function runFullSync() {
 }
 
 function startWatcher() {
-  const watchTargets = [CONFIG.projectsRoot];
+  const watchTargets = CONFIG.projectRoots.slice();
   if (DEFAULT_IGNORE_CONFIG_PATH) {
     watchTargets.push(DEFAULT_IGNORE_CONFIG_PATH);
   }
 
-  const watcher = chokidar.watch(watchTargets, {
+  const uniqueTargets = Array.from(new Set(watchTargets.map((target) => path.resolve(target))));
+
+  const watcher = chokidar.watch(uniqueTargets, {
     persistent: true,
     ignoreInitial: true,
     ignored: (target) => shouldIgnorePath(target)
@@ -260,10 +310,14 @@ function resolveProjectFromPath(targetPath) {
     return null;
   }
   const absolute = path.resolve(targetPath);
-  if (!absolute.startsWith(CONFIG.projectsRoot)) {
+  const root = CONFIG.projectRoots.find((rootPath) => {
+    const normalizedRoot = path.resolve(rootPath);
+    return absolute === normalizedRoot || absolute.startsWith(`${normalizedRoot}${path.sep}`);
+  });
+  if (!root) {
     return null;
   }
-  const relative = path.relative(CONFIG.projectsRoot, absolute);
+  const relative = path.relative(root, absolute);
   if (!relative || relative.startsWith('..')) {
     return null;
   }
@@ -275,15 +329,19 @@ function resolveProjectFromPath(targetPath) {
   if (!topLevel || topLevel.startsWith('.')) {
     return null;
   }
-  return path.join(CONFIG.projectsRoot, topLevel);
+  return path.join(root, topLevel);
 }
 
 function shouldIgnorePath(target) {
   const absolute = path.resolve(target);
-  if (!absolute.startsWith(CONFIG.projectsRoot)) {
+  const root = CONFIG.projectRoots.find((rootPath) => {
+    const normalizedRoot = path.resolve(rootPath);
+    return absolute === normalizedRoot || absolute.startsWith(`${normalizedRoot}${path.sep}`);
+  });
+  if (!root) {
     return false;
   }
-  const relative = path.relative(CONFIG.projectsRoot, absolute);
+  const relative = path.relative(root, absolute);
   if (!relative) {
     return false;
   }
