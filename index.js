@@ -54,7 +54,8 @@ const CONFIG = {
   projectsRoot: PRIMARY_PROJECT_ROOT,
   additionalProjectRoots: ADDITIONAL_PROJECT_ROOTS,
   syncIntervalMinutes: Number(process.env.SYNC_INTERVAL_MINUTES || '0'),
-  debounceMs: Number(process.env.SYNC_DEBOUNCE_MS || '5000')
+  debounceMs: Number(process.env.SYNC_DEBOUNCE_MS || '5000'),
+  pruneAgeDays: Math.max(0, Number(process.env.PRUNE_AGE_DAYS || '0'))
 };
 
 CONFIG.projectRoots = Array.from(new Set([CONFIG.projectsRoot, ...CONFIG.additionalProjectRoots]));
@@ -397,7 +398,7 @@ async function syncSinglePath(projectPath, absolutePath, event) {
   const message = `Auto backup (quick) ${relativePath} ${new Date().toISOString()}`;
   try {
     await runGit(projectPath, ['commit', '-m', message]);
-    await pushChanges(projectPath);
+    await pushChanges(projectPath, { pruneAfter: false });
     console.log(`[${repoName}] Quick sync committed ${relativePath}`);
   } catch (error) {
     console.error(`[${repoName}] Quick sync failed: ${error.message}`);
@@ -467,7 +468,7 @@ async function syncProject(projectPath) {
     await commitChanges(projectPath);
   }
 
-  await pushChanges(projectPath);
+  await pushChanges(projectPath, { pruneAfter: true });
   console.log(`[${repoName}] Sync complete${changesDetected ? ' (changes pushed)' : ' (no changes)'}`);
 }
 
@@ -617,12 +618,9 @@ async function commitChanges(projectPath) {
   }
 }
 
-async function pushChanges(projectPath) {
+async function pushChanges(projectPath, { pruneAfter = false } = {}) {
   const branch = await currentBranch(projectPath);
   const hasUpstream = await branchHasUpstream(projectPath, branch);
-  const pushArgs = hasUpstream
-    ? ['push', REMOTE_NAME, branch]
-    : ['push', '--set-upstream', REMOTE_NAME, branch];
 
   const pushEnv = {
     ...process.env,
@@ -631,19 +629,40 @@ async function pushChanges(projectPath) {
     GIT_PASSWORD: CONFIG.token
   };
 
+  const pushArgs = hasUpstream
+    ? ['push', REMOTE_NAME, branch]
+    : ['push', '--set-upstream', REMOTE_NAME, branch];
+
   try {
+    await runGit(projectPath, ['fetch', '--all'], { env: pushEnv });
     await runGit(projectPath, pushArgs, { env: pushEnv });
-    return;
   } catch (error) {
-    if (!/non-fast-forward|fetch first|failed to push/.test(error.message)) {
+    if (/non-fast-forward|fetch first|tip of your current branch is behind/.test(error.message)) {
+      await runGit(projectPath, ['pull', '--rebase', REMOTE_NAME, branch], { env: pushEnv });
+      await runGit(projectPath, pushArgs, { env: pushEnv });
+    } else {
       throw error;
     }
   }
 
-  const forceArgs = hasUpstream
-    ? ['push', '--force', REMOTE_NAME, branch]
-    : ['push', '--set-upstream', '--force', REMOTE_NAME, branch];
-  await runGit(projectPath, forceArgs, { env: pushEnv });
+  if (pruneAfter) {
+    await pruneRepository(projectPath);
+  }
+}
+
+
+async function pruneRepository(projectPath) {
+  const days = Number.isFinite(CONFIG.pruneAgeDays) ? CONFIG.pruneAgeDays : 0;
+  if (!days || days <= 0) return;
+  const repoName = path.basename(projectPath);
+  const pruneArg = `${days}.days`;
+  try {
+    await runGit(projectPath, ['reflog', 'expire', `--expire=${pruneArg}`, '--all']);
+    await runGit(projectPath, ['gc', `--prune=${pruneArg}`]);
+    console.log(`[${repoName}] Pruned git history older than ${days} day(s)`);
+  } catch (error) {
+    console.warn(`[${repoName}] Warning: git maintenance failed (${error.message})`);
+  }
 }
 
 async function currentBranch(projectPath) {

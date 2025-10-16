@@ -18,10 +18,11 @@ Licensed under the GNU General Public License v2.0. See the [LICENSE](./LICENSE)
    GITEA_BASE_URL=https://gitea.example.com
    GITEA_OWNER=<username>
    GITEA_TOKEN=<your token>
-   PROJECTS_ROOT=/path/to/projects
-   PROJECTS_ADDITIONAL_ROOTS=/path/to/projects_archive
-   SYNC_INTERVAL_MINUTES=0
-   SYNC_DEBOUNCE_MS=5000
+  PROJECTS_ROOT=/path/to/projects
+  PROJECTS_ADDITIONAL_ROOTS=/path/to/projects_archive
+  SYNC_INTERVAL_MINUTES=0
+  SYNC_DEBOUNCE_MS=5000
+  PRUNE_AGE_DAYS=0
    ```
 4. **Install dependencies once**:
    ```bash
@@ -54,6 +55,7 @@ The script will:
 - Mirror multiple directories by setting `PROJECTS_ADDITIONAL_ROOTS` to a comma-separated list (e.g. `/projects_archive,/external/projects`). If not provided, the tool automatically includes a sibling `projects_archive` directory when it exists.
 - Customize `ignoreconfig.json` (or set `IGNORE_CONFIG_PATH`) to control which patterns are added to new repositories’ `.gitignore` files.
 - Set `GIT_AUTHOR_NAME` / `GIT_AUTHOR_EMAIL` if you want mirrored commits to carry your own identity (use an address verified with your Git host to show your avatar).
+- Use `PRUNE_AGE_DAYS` to run `git gc` automatically after each full sync; set to `0` to disable pruning.
 
 ### Optional: Kubernetes deployment
 
