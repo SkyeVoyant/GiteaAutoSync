@@ -1,17 +1,20 @@
 version: "3.9"
 services:
   autosync:
+    container_name: GiteaAutoSync
     build: .
     environment:
       GITEA_BASE_URL: ${GITEA_BASE_URL:-https://gitea.example.com}
       GITEA_OWNER: ${GITEA_OWNER:-gitea-user}
       GITEA_TOKEN: ${GITEA_TOKEN:-replace-me}
       PROJECTS_ROOT: /data/projects
+      PROJECTS_ADDITIONAL_ROOTS: /data/projects_archive
       SYNC_INTERVAL_MINUTES: ${SYNC_INTERVAL_MINUTES:-0}
       SYNC_DEBOUNCE_MS: ${SYNC_DEBOUNCE_MS:-5000}
       IGNORE_CONFIG_PATH: ${IGNORE_CONFIG_PATH:-/app/ignoreconfig.json}
     volumes:
-      - ./projects:/data/projects:ro
+      - ${PROJECTS_ROOT:-/root/projects}:/data/projects
+      - ${PROJECTS_ADDITIONAL_ROOTS:-/root/projects_archive}:/data/projects_archive
     restart: unless-stopped
     # Uncomment to observe logs locally
     # tty: true

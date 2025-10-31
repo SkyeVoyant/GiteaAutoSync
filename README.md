@@ -80,9 +80,18 @@ The file watcher is highly optimized for large project trees:
 ## Docker Compose
 Lightweight compose stack included:
 ```bash
+# First, configure your .env file
+cp .env.example .env
+# Edit .env and set:
+#   GITEA_BASE_URL, GITEA_TOKEN, GITEA_OWNER
+#   PROJECTS_ROOT (path to your main projects directory)
+#   PROJECTS_ADDITIONAL_ROOTS (path to additional directories, e.g., projects_archive)
+
+# Then build and run
 docker compose up -d --build
 ```
-Mount additional project paths and override any environment variable in `.env` or inline when you start the stack.
+
+The compose file automatically mounts `PROJECTS_ROOT` and `PROJECTS_ADDITIONAL_ROOTS` from your `.env` as volumes. Defaults to `/root/projects` and `/root/projects_archive` if not specified.
 
 ## Kubernetes (Kustomize)
 `deploy/base` contains a minimal Deployment that installs Git, clones this repo, and runs watch mode. Provide:
