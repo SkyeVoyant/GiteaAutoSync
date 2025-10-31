@@ -2,6 +2,9 @@ FROM node:20-alpine
 
 WORKDIR /app
 
+# Install git (required for autosync)
+RUN apk add --no-cache git
+
 # Enable pnpm
 RUN corepack enable pnpm
 
