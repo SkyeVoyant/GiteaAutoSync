@@ -4,6 +4,7 @@ require('dotenv').config();
 
 const axios = require('axios').default;
 const chokidar = require('chokidar');
+const ignore = require('ignore');
 const fs = require('fs/promises');
 const fsSync = require('fs');
 const path = require('path');
@@ -43,6 +44,7 @@ const DEFAULT_IGNORE_CONFIG_PATH = process.env.IGNORE_CONFIG_PATH
   : path.join(__dirname, 'ignoreconfig.json');
 let cachedIgnorePatterns = null;
 let ignoreDirectorySegments = new Set(['.git']);
+let gitignoreFilters = new Map(); // Map of projectPath -> ignore filter
 
 const PRIMARY_PROJECT_ROOT = resolveProjectsRoot();
 const ADDITIONAL_PROJECT_ROOTS = resolveAdditionalProjectRoots(PRIMARY_PROJECT_ROOT);
@@ -125,7 +127,7 @@ async function main() {
     : null;
 
   if (watchMode) {
-    const watcher = startWatcher();
+    const watcher = await startWatcher();
     if (intervalMs) {
       console.log(`Watching for changes and running a full resync every ${CONFIG.syncIntervalMinutes} minute(s).`);
       setInterval(() => {
@@ -223,7 +225,99 @@ async function runFullSync() {
   }
 }
 
-function startWatcher() {
+async function loadGitignoreFilters() {
+  // Load .gitignore files from all project directories
+  gitignoreFilters.clear();
+  
+  for (const rootDir of CONFIG.projectRoots) {
+    try {
+      const projectDirs = await discoverProjectDirectories(rootDir);
+      for (const projectPath of projectDirs) {
+        const gitignorePath = path.join(projectPath, '.gitignore');
+        try {
+          const gitignoreContent = await fs.readFile(gitignorePath, 'utf8');
+          const ig = ignore().add(gitignoreContent);
+          gitignoreFilters.set(projectPath, ig);
+        } catch (error) {
+          // No .gitignore file or can't read it, skip
+          if (error.code !== 'ENOENT') {
+            console.warn(`[${path.basename(projectPath)}] Warning: Could not read .gitignore (${error.message})`);
+          }
+        }
+      }
+    } catch (error) {
+      console.warn(`Could not load gitignore files from ${rootDir}: ${error.message}`);
+    }
+  }
+  
+  console.log(`Loaded .gitignore patterns from ${gitignoreFilters.size} project(s)`);
+}
+
+function buildChokidarIgnorePatterns() {
+  // Build efficient glob patterns for chokidar to prevent scanning ignored directories
+  const patterns = [];
+  
+  // Always ignore .git directories
+  patterns.push(/(^|[/\\])\\.git($|[/\\])/);
+  
+  // Add patterns from ignore config
+  const ignorePatterns = cachedIgnorePatterns || BUILTIN_IGNORE_PATTERNS;
+  
+  // Convert directory patterns to regex for efficient matching
+  ignorePatterns.forEach((pattern) => {
+    if (pattern.endsWith('/')) {
+      // Directory pattern - match anywhere in the path
+      const dirName = pattern.slice(0, -1).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      patterns.push(new RegExp(`(^|[/\\\\])${dirName}($|[/\\\\])`));
+    } else if (pattern.includes('*')) {
+      // Wildcard pattern - convert to regex
+      const regexPattern = pattern
+        .replace(/\./g, '\\.')
+        .replace(/\*/g, '.*')
+        .replace(/\?/g, '.');
+      patterns.push(new RegExp(regexPattern));
+    } else {
+      // Exact match pattern
+      const escapedPattern = pattern.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      patterns.push(new RegExp(`(^|[/\\\\])${escapedPattern}$`));
+    }
+  });
+  
+  // Return a function that tests against all patterns
+  return (filePath) => {
+    // Normalize path separators
+    const normalizedPath = filePath.replace(/\\/g, '/');
+    
+    // Test against all patterns first
+    for (const pattern of patterns) {
+      if (pattern.test(normalizedPath)) {
+        return true;
+      }
+    }
+    
+    // Check against project-specific .gitignore files
+    for (const [projectPath, ig] of gitignoreFilters.entries()) {
+      // Check if this file is within this project
+      const absolutePath = path.resolve(filePath);
+      const absoluteProjectPath = path.resolve(projectPath);
+      
+      if (absolutePath.startsWith(absoluteProjectPath + path.sep) || absolutePath === absoluteProjectPath) {
+        // Get relative path from project root
+        const relativePath = path.relative(absoluteProjectPath, absolutePath);
+        if (relativePath && !relativePath.startsWith('..')) {
+          // Use the ignore filter to check if this path should be ignored
+          if (ig.ignores(relativePath)) {
+            return true;
+          }
+        }
+      }
+    }
+    
+    return false;
+  };
+}
+
+async function startWatcher() {
   const watchTargets = CONFIG.projectRoots.slice();
   if (DEFAULT_IGNORE_CONFIG_PATH) {
     watchTargets.push(DEFAULT_IGNORE_CONFIG_PATH);
@@ -231,10 +325,30 @@ function startWatcher() {
 
   const uniqueTargets = Array.from(new Set(watchTargets.map((target) => path.resolve(target))));
 
+  // Load .gitignore files from all projects
+  await loadGitignoreFilters();
+
+  // Build efficient glob patterns for chokidar
+  const ignorePatterns = buildChokidarIgnorePatterns();
+
+  console.log('Starting file watcher with optimized ignore patterns (including .gitignore)...');
+  console.log(`Watching ${uniqueTargets.length} root director(ies)`);
+
   const watcher = chokidar.watch(uniqueTargets, {
     persistent: true,
     ignoreInitial: true,
-    ignored: (target) => shouldIgnorePath(target)
+    ignored: ignorePatterns,
+    // Depth limiting to prevent excessive scanning
+    depth: 10,
+    // Use polling fallback for large directories
+    usePolling: false,
+    // Reduce memory usage by not tracking file stats
+    alwaysStat: false,
+    // Atomic writes detection
+    awaitWriteFinish: {
+      stabilityThreshold: 500,
+      pollInterval: 100
+    }
   });
 
   watcher.on('all', (event, filePath) => {
@@ -247,15 +361,22 @@ function startWatcher() {
     console.error(`Watcher error: ${error.message}`);
   });
 
+  watcher.on('ready', () => {
+    console.log('File watcher initialized and ready');
+  });
+
   return watcher;
 }
 
 async function handleWatchEvent(event, filePath) {
   const absolutePath = path.resolve(filePath);
+  
+  // Check if ignore configuration changed
   if (DEFAULT_IGNORE_CONFIG_PATH && absolutePath === DEFAULT_IGNORE_CONFIG_PATH) {
     console.log('Ignore configuration changed, reloading patterns.');
     cachedIgnorePatterns = null;
     await getIgnorePatterns();
+    await loadGitignoreFilters();
     runFullSync().catch((error) => {
       console.error(`Background full sync failed: ${error.message}`);
     });
@@ -266,6 +387,15 @@ async function handleWatchEvent(event, filePath) {
   if (!projectPath) {
     return;
   }
+
+  // Check if a .gitignore file was modified
+  if (path.basename(absolutePath) === '.gitignore') {
+    console.log(`[${path.basename(projectPath)}] .gitignore changed, reloading patterns.`);
+    await loadGitignoreFilters();
+    // Don't trigger a full sync, just reload the patterns
+    return;
+  }
+
   await queueQuickSync(projectPath, absolutePath, event);
   scheduleProject(projectPath);
 }

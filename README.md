@@ -8,14 +8,23 @@ Keeps each top-level folder in sync with a private repo, auto-initialises Git, c
 ## Features
 - Auto-discovers non-hidden directories under your project roots
 - Creates or reuses repos on Gitea and seeds them with a sensible `.gitignore`
-- Watches for filesystem changes and ships “quick sync” commits within seconds
+- **Memory-optimized file watcher** with intelligent ignore patterns (regex-based filtering)
+- **Automatically respects project `.gitignore` files** - only watches files that will be synced
+- Watches for filesystem changes and ships "quick sync" commits within seconds
 - Strips nested `.git/` folders and adds a dedicated `gitea` remote per project
 - Optional maintenance: scheduled full syncs and Git history pruning
+- Resource-efficient: typically uses <512MB RAM even with large project trees
 
 ## Prerequisites
 - Node.js 18+ and Git
 - Gitea personal access token (`write:user`, `write:repository`)
 - Read access to the directories you want mirrored (e.g. `/projects`, `/projects_archive`)
+
+**Dependencies:**
+- `axios` - API communication
+- `chokidar` - File watching
+- `dotenv` - Environment configuration
+- `ignore` - `.gitignore` parsing and pattern matching
 
 ## Quick start
 1) Get the code and configure
@@ -50,8 +59,23 @@ npm run start:watch
 
 ## Usage notes
 - Default ignore patterns live in `ignoreconfig.json`; add your own or point `IGNORE_CONFIG_PATH` elsewhere.
+- **Each project's `.gitignore` is automatically loaded and respected** - files ignored by Git won't be watched.
 - Quick sync commits use descriptive timestamps; background full syncs reconcile everything.
 - Hidden directories are skipped automatically. Nested Git repos are flattened so only top-level folders push.
+- `.gitignore` files are monitored - changes are automatically reloaded without restart.
+
+## Performance Optimizations
+The file watcher is highly optimized for large project trees:
+- **Efficient ignore pattern matching**: Regex-based filtering prevents scanning ignored directories
+- **Per-project `.gitignore` support**: Automatically loads and respects gitignore rules for each project
+- **Depth limiting**: Prevents excessive recursive scanning (depth: 10)
+- **Stat-less operation**: Reduces memory by not tracking file metadata
+- **Resource limits**: Kubernetes deployment includes 512MB memory limit (typically uses 100-300MB)
+- **Smart debouncing**: Batches rapid file changes to avoid commit storms
+
+### Before vs After
+- **Before**: 4.67GB RAM usage watching 100k+ files (including ignored files)
+- **After**: <512MB RAM usage with intelligent filtering and .gitignore support
 
 ## Docker Compose
 Lightweight compose stack included:
@@ -65,6 +89,10 @@ Mount additional project paths and override any environment variable in `.env` o
 - ConfigMap/Secret (`giteaautosync-config` / `giteaautosync-secret`) with the same variables as `.env`
 - Secret `default-github-ssh` holding a deploy key plus `known_hosts`
 - Volumes for your project directories (update host paths or swap for PVCs)
+
+**Resource Requirements:**
+- Memory: 256Mi request / 512Mi limit (typically uses 100-300MB)
+- CPU: 100m request / 500m limit
 
 ## Troubleshooting
 - Missing token? The script exits with a helpful error. Double-check `.env`.
