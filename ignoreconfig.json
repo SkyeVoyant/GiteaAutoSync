@@ -2,6 +2,8 @@
   "patterns": [
     "node_modules/",
     "dist/",
+    "dist-debug/",
+    "dist-no-min/",
     "build/",
     "logs/",
     "tmp/",
@@ -11,6 +13,7 @@
     "coverage/",
     "data/",
     ".env",
+    ".env.*",
     "*.log",
     "*.tmp",
     "*.sqlite",
@@ -19,6 +22,7 @@
     "*.zip",
     "*.tgz",
     "*.gz",
+    "*.exe",
     "__pycache__/",
     ".DS_Store"
   ]
