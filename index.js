@@ -14,6 +14,43 @@ const util = require('util');
 
 const execFileAsync = util.promisify(execFile);
 
+function parsePositiveInt(value, fallback) {
+  const num = Number(value);
+  return Number.isFinite(num) && num > 0 ? num : fallback;
+}
+
+const BUILTIN_IGNORE_PATTERNS = [
+  'node_modules/',
+  'dist/',
+  'build/',
+  'logs/',
+  'tmp/',
+  'backup/',
+  'cache/',
+  '.cache/',
+  'coverage/',
+  'data/',
+  '.env',
+  '.env.*',
+  '*.log',
+  '*.tmp',
+  '*.sqlite',
+  '*.db',
+  '*.tar',
+  '*.zip',
+  '*.tgz',
+  '*.gz',
+  '__pycache__/',
+  '.DS_Store'
+];
+
+const DEFAULT_IGNORE_CONFIG_PATH = process.env.IGNORE_CONFIG_PATH
+  ? path.resolve(process.env.IGNORE_CONFIG_PATH)
+  : path.join(__dirname, 'ignoreconfig.json');
+let cachedIgnorePatterns = null;
+let ignoreDirectorySegments = new Set(['.git']);
+let gitignoreFilters = new Map(); // Map of projectPath -> ignore filter
+
 const PRIMARY_PROJECT_ROOT = resolveProjectsRoot();
 const ADDITIONAL_PROJECT_ROOTS = resolveAdditionalProjectRoots(PRIMARY_PROJECT_ROOT);
 
@@ -23,8 +60,13 @@ const CONFIG = {
   owner: process.env.GITEA_OWNER || 'autosync',
   projectsRoot: PRIMARY_PROJECT_ROOT,
   additionalProjectRoots: ADDITIONAL_PROJECT_ROOTS,
-  debounceMs: Number(process.env.SYNC_DEBOUNCE_MS || '5000')
+  syncIntervalMinutes: Number(process.env.SYNC_INTERVAL_MINUTES || '0'),
+  debounceMs: parsePositiveInt(process.env.SYNC_DEBOUNCE_MS, 5000),
+  maxDebounceMs: parsePositiveInt(process.env.SYNC_MAX_DEBOUNCE_MS, 60000),
+  pruneAgeDays: Math.max(0, Number(process.env.PRUNE_AGE_DAYS || '0'))
 };
+
+CONFIG.maxDebounceMs = Math.max(CONFIG.maxDebounceMs, CONFIG.debounceMs * 2);
 
 CONFIG.projectRoots = Array.from(new Set([CONFIG.projectsRoot, ...CONFIG.additionalProjectRoots]));
 
@@ -42,7 +84,9 @@ const ASKPASS_SCRIPT_PATH = path.join(os.tmpdir(), `gitea-askpass-${Date.now()}.
 const pendingProjects = new Set();
 let flushTimer = null;
 let queueProcessing = false;
-let gitignoreFilters = new Map(); // Map of projectPath -> ignore filter
+let quickSyncChain = Promise.resolve();
+let fullSyncPromise = null;
+let firstPendingAt = null;
 
 function getBaseUrl() {
   const fallback = 'https://gitea.example.com';
@@ -79,18 +123,30 @@ function resolveAdditionalProjectRoots(primaryRoot) {
 async function main() {
   validateConfig();
   await ensureAskPassScript();
+  await getIgnorePatterns();
   await ensureProjectRootsExist();
 
   const args = process.argv.slice(2);
   const watchMode = args.includes('--watch');
 
-  console.log('Running initial sync of all projects...');
   await runFullSync();
-  console.log('Initial sync complete.');
+
+  const intervalMs = CONFIG.syncIntervalMinutes > 0
+    ? CONFIG.syncIntervalMinutes * 60 * 1000
+    : null;
 
   if (watchMode) {
     const watcher = await startWatcher();
-    console.log('Watching for filesystem changes...');
+    if (intervalMs) {
+      console.log(`Watching for changes and running a full resync every ${CONFIG.syncIntervalMinutes} minute(s).`);
+      setInterval(() => {
+        runFullSync().catch((error) => {
+          console.error(`Scheduled run failed: ${error.message}`);
+        });
+      }, intervalMs);
+    } else {
+      console.log('Watching for filesystem changes (no scheduled full resync configured).');
+    }
 
     const shutdown = async () => {
       try {
@@ -103,14 +159,19 @@ async function main() {
 
     process.on('SIGINT', shutdown);
     process.on('SIGTERM', shutdown);
-  } else {
-    console.log('Single sync completed. Exiting.');
+  } else if (intervalMs) {
+    console.log(`Running initial sync and scheduling subsequent runs every ${CONFIG.syncIntervalMinutes} minute(s).`);
+    setInterval(() => {
+      runFullSync().catch((error) => {
+        console.error(`Scheduled run failed: ${error.message}`);
+      });
+    }, intervalMs);
   }
 }
 
 function validateConfig() {
   if (!CONFIG.token) {
-    console.error('Missing GITEA_TOKEN. Please set it in your .env file.');
+    console.error('Missing GITEA_TOKEN. Please copy .env.example to .env and fill in the token.');
     process.exit(1);
   }
 }
@@ -151,6 +212,11 @@ async function discoverProjectDirectories(rootDir) {
 }
 
 async function runFullSync() {
+  if (fullSyncPromise) {
+    return fullSyncPromise;
+  }
+
+  fullSyncPromise = (async () => {
     for (const rootDir of CONFIG.projectRoots) {
       const projectDirs = await discoverProjectDirectories(rootDir);
       for (const projectPath of projectDirs) {
@@ -158,6 +224,13 @@ async function runFullSync() {
           console.error(`[${path.basename(projectPath)}] ERROR: ${error.message}`);
         });
       }
+    }
+  })();
+
+  try {
+    await fullSyncPromise;
+  } finally {
+    fullSyncPromise = null;
   }
 }
 
@@ -175,7 +248,10 @@ async function loadGitignoreFilters() {
           const ig = ignore().add(gitignoreContent);
           gitignoreFilters.set(projectPath, ig);
         } catch (error) {
-          // No .gitignore file, skip this project
+          // No .gitignore file or can't read it, skip
+          if (error.code !== 'ENOENT') {
+            console.warn(`[${path.basename(projectPath)}] Warning: Could not read .gitignore (${error.message})`);
+          }
         }
       }
     } catch (error) {
@@ -183,31 +259,62 @@ async function loadGitignoreFilters() {
     }
   }
   
-  console.log(`Loaded .gitignore from ${gitignoreFilters.size} project(s)`);
+  console.log(`Loaded .gitignore patterns from ${gitignoreFilters.size} project(s)`);
 }
 
-function shouldIgnoreFile(filePath) {
-  const normalized = path.normalize(filePath);
+function buildChokidarIgnorePatterns() {
+  // Build efficient glob patterns for chokidar to prevent scanning ignored directories
+  const patterns = [];
   
-  // Always ignore .git directories and their contents
-  const pathParts = normalized.split(path.sep);
-  if (pathParts.includes('.git')) {
-    return true;
+  // Always ignore .git directories
+  patterns.push(/(^|[/\\])\\.git($|[/\\])/);
+  
+  // Add patterns from ignore config
+  const ignorePatterns = cachedIgnorePatterns || BUILTIN_IGNORE_PATTERNS;
+  
+  // Convert directory patterns to regex for efficient matching
+  ignorePatterns.forEach((pattern) => {
+    if (pattern.endsWith('/')) {
+      // Directory pattern - match anywhere in the path
+      const dirName = pattern.slice(0, -1).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      patterns.push(new RegExp(`(^|[/\\\\])${dirName}($|[/\\\\])`));
+    } else if (pattern.includes('*')) {
+      // Wildcard pattern - convert to regex
+      const regexPattern = pattern
+        .replace(/\./g, '\\.')
+        .replace(/\*/g, '.*')
+        .replace(/\?/g, '.');
+      patterns.push(new RegExp(regexPattern));
+    } else {
+      // Exact match pattern
+      const escapedPattern = pattern.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      patterns.push(new RegExp(`(^|[/\\\\])${escapedPattern}$`));
     }
+  });
   
-  // Ignore node_modules
-  if (pathParts.includes('node_modules')) {
+  // Return a function that tests against all patterns
+  return (filePath) => {
+    // Normalize path separators
+    const normalizedPath = filePath.replace(/\\/g, '/');
+    
+    // Test against all patterns first
+    for (const pattern of patterns) {
+      if (pattern.test(normalizedPath)) {
         return true;
+      }
     }
     
     // Check against project-specific .gitignore files
     for (const [projectPath, ig] of gitignoreFilters.entries()) {
+      // Check if this file is within this project
       const absolutePath = path.resolve(filePath);
       const absoluteProjectPath = path.resolve(projectPath);
       
       if (absolutePath.startsWith(absoluteProjectPath + path.sep) || absolutePath === absoluteProjectPath) {
+        // Get relative path from project root
         const relativePath = path.relative(absoluteProjectPath, absolutePath);
         if (relativePath && !relativePath.startsWith('..')) {
+          // Use the ignore filter to check if this path should be ignored
           if (ig.ignores(relativePath)) {
             return true;
           }
@@ -216,24 +323,37 @@ function shouldIgnoreFile(filePath) {
     }
     
     return false;
+  };
 }
 
 async function startWatcher() {
   const watchTargets = CONFIG.projectRoots.slice();
+  if (DEFAULT_IGNORE_CONFIG_PATH) {
+    watchTargets.push(DEFAULT_IGNORE_CONFIG_PATH);
+  }
+
   const uniqueTargets = Array.from(new Set(watchTargets.map((target) => path.resolve(target))));
 
   // Load .gitignore files from all projects
   await loadGitignoreFilters();
 
+  // Build efficient glob patterns for chokidar
+  const ignorePatterns = buildChokidarIgnorePatterns();
+
+  console.log('Starting file watcher with optimized ignore patterns (including .gitignore)...');
   console.log(`Watching ${uniqueTargets.length} root director(ies)`);
 
   const watcher = chokidar.watch(uniqueTargets, {
     persistent: true,
     ignoreInitial: true,
-    ignored: shouldIgnoreFile,
+    ignored: ignorePatterns,
+    // Depth limiting to prevent excessive scanning
     depth: 10,
+    // Use polling fallback for large directories
     usePolling: false,
+    // Reduce memory usage by not tracking file stats
     alwaysStat: false,
+    // Atomic writes detection
     awaitWriteFinish: {
       stabilityThreshold: 500,
       pollInterval: 100
@@ -259,25 +379,33 @@ async function startWatcher() {
 
 async function handleWatchEvent(event, filePath) {
   const absolutePath = path.resolve(filePath);
-  const projectPath = resolveProjectFromPath(absolutePath);
   
-  if (!projectPath) {
-    console.log(`[WATCH] Ignoring file outside project roots: ${filePath}`);
+  // Check if ignore configuration changed
+  if (DEFAULT_IGNORE_CONFIG_PATH && absolutePath === DEFAULT_IGNORE_CONFIG_PATH) {
+    console.log('Ignore configuration changed, reloading patterns.');
+    cachedIgnorePatterns = null;
+    await getIgnorePatterns();
+    await loadGitignoreFilters();
+    runFullSync().catch((error) => {
+      console.error(`Background full sync failed: ${error.message}`);
+    });
     return;
   }
 
-  const relativePath = path.relative(projectPath, absolutePath);
-  console.log(`[WATCH] Event: ${event}, Project: ${path.basename(projectPath)}, File: ${relativePath}`);
+  const projectPath = resolveProjectFromPath(absolutePath);
+  if (!projectPath) {
+    return;
+  }
 
-  // If a .gitignore file was modified, reload patterns
+  // Check if a .gitignore file was modified
   if (path.basename(absolutePath) === '.gitignore') {
     console.log(`[${path.basename(projectPath)}] .gitignore changed, reloading patterns.`);
     await loadGitignoreFilters();
-    // Trigger a sync to commit the .gitignore change
-    scheduleProject(projectPath);
+    // Don't trigger a full sync, just reload the patterns
     return;
   }
 
+  await queueQuickSync(projectPath, absolutePath, event);
   scheduleProject(projectPath);
 }
 
@@ -285,38 +413,41 @@ function scheduleProject(projectPath) {
   const repoName = path.basename(projectPath);
   const isNew = !pendingProjects.has(projectPath);
   pendingProjects.add(projectPath);
-  
+  if (isNew) {
+    console.log(`[${repoName}] Change detected, queued for sync`);
+  }
+
+  const now = Date.now();
+  if (firstPendingAt === null) {
+    firstPendingAt = now;
+  }
+
+  const elapsed = now - firstPendingAt;
+  if (elapsed >= CONFIG.maxDebounceMs) {
+    console.log(`[${repoName}] Max debounce window (${CONFIG.maxDebounceMs}ms) reached, flushing queue.`);
+    flushQueueNow();
+    return;
+  }
+
   if (flushTimer) {
     clearTimeout(flushTimer);
   }
-  
-  flushTimer = setTimeout(async () => {
-    console.log(`[DEBOUNCE] Period ended, processing ${pendingProjects.size} project(s)...`);
+  flushTimer = setTimeout(() => {
     flushTimer = null;
-    try {
-      await processQueue();
-    } catch (error) {
-      console.error(`[ERROR] Queue processing failed: ${error.message}`);
-      console.error(error.stack);
-    }
+    flushQueueNow();
   }, CONFIG.debounceMs);
-  
-  console.log(`[TIMER] Set timeout for ${CONFIG.debounceMs}ms, timer ID: ${flushTimer}`);
-  
+
   if (isNew) {
-    console.log(`[${repoName}] Change detected, queued for sync (debounce: ${CONFIG.debounceMs}ms)`);
+    console.log(`[${repoName}] Debounce timer set to ${CONFIG.debounceMs}ms`);
   }
 }
 
 async function processQueue() {
-  console.log(`[QUEUE] processQueue called, queueProcessing=${queueProcessing}, pending=${pendingProjects.size}`);
   if (queueProcessing) {
-    console.log(`[QUEUE] Already processing, skipping`);
     return;
   }
   queueProcessing = true;
   try {
-    console.log(`[QUEUE] Starting to process ${pendingProjects.size} project(s)`);
     while (pendingProjects.size > 0) {
       const [projectPath] = pendingProjects;
       pendingProjects.delete(projectPath);
@@ -324,10 +455,25 @@ async function processQueue() {
         console.error(`[${path.basename(projectPath)}] ERROR: ${error.message}`);
       });
     }
-    console.log(`[QUEUE] Finished processing`);
   } finally {
     queueProcessing = false;
+    if (pendingProjects.size === 0) {
+      firstPendingAt = null;
+    }
   }
+}
+
+function flushQueueNow() {
+  if (flushTimer) {
+    clearTimeout(flushTimer);
+    flushTimer = null;
+  }
+  if (queueProcessing) {
+    return;
+  }
+  processQueue().catch((error) => {
+    console.error(`Queue processing failed: ${error.message}`);
+  });
 }
 
 function resolveProjectFromPath(targetPath) {
@@ -357,14 +503,133 @@ function resolveProjectFromPath(targetPath) {
   return path.join(root, topLevel);
 }
 
+function shouldIgnorePath(target) {
+  const absolute = path.resolve(target);
+  const root = CONFIG.projectRoots.find((rootPath) => {
+    const normalizedRoot = path.resolve(rootPath);
+    return absolute === normalizedRoot || absolute.startsWith(`${normalizedRoot}${path.sep}`);
+  });
+  if (!root) {
+    return false;
+  }
+  const relative = path.relative(root, absolute);
+  if (!relative) {
+    return false;
+  }
+  const segments = relative.split(path.sep);
+  return segments.some((segment) => ignoreDirectorySegments.has(segment));
+}
+
+async function hasStagedChanges(projectPath) {
+  try {
+    await execFileAsync('git', ['diff', '--cached', '--quiet'], { cwd: projectPath });
+    return false;
+  } catch (error) {
+    if (error.code === 1) {
+      return true;
+    }
+    throw error;
+  }
+}
+
+async function queueQuickSync(projectPath, absolutePath, event) {
+  quickSyncChain = quickSyncChain.then(() => syncSinglePath(projectPath, absolutePath, event))
+    .catch((error) => {
+      console.error(`Quick sync error: ${error.message}`);
+    });
+  await quickSyncChain;
+}
+
+async function syncSinglePath(projectPath, absolutePath, event) {
+  const repoName = path.basename(projectPath);
+  const relativePath = path.relative(projectPath, absolutePath);
+  if (!relativePath || relativePath.startsWith('..')) {
+    return;
+  }
+
+  try {
+    if (event === 'unlink' || event === 'unlinkDir') {
+      await runGit(projectPath, ['rm', '-rf', relativePath]);
+    } else {
+      await runGit(projectPath, ['add', relativePath]);
+    }
+  } catch (error) {
+    if (!/fatal: pathspec/.test(error.message)) {
+      console.warn(`[${repoName}] Failed to stage ${relativePath}: ${error.message}`);
+    }
+    return;
+  }
+
+  const hasChanges = await hasStagedChanges(projectPath);
+  if (!hasChanges) {
+    return;
+  }
+
+  const message = `Auto backup (quick) ${relativePath} ${new Date().toISOString()}`;
+  try {
+    await runGit(projectPath, ['commit', '-m', message]);
+    await pushChanges(projectPath, { pruneAfter: false });
+    console.log(`[${repoName}] Quick sync committed ${relativePath}`);
+  } catch (error) {
+    console.error(`[${repoName}] Quick sync failed: ${error.message}`);
+  }
+}
+
+async function getIgnorePatterns() {
+  if (cachedIgnorePatterns) {
+    return cachedIgnorePatterns;
+  }
+  try {
+    const raw = await fs.readFile(DEFAULT_IGNORE_CONFIG_PATH, 'utf8');
+    const parsed = JSON.parse(raw);
+    if (!parsed || !Array.isArray(parsed.patterns)) {
+      throw new Error('missing "patterns" array');
+    }
+    cachedIgnorePatterns = normalizePatterns(parsed.patterns);
+  } catch (error) {
+    console.warn(`Could not read ignore config from ${DEFAULT_IGNORE_CONFIG_PATH}, using built-in patterns. (${error.message})`);
+    cachedIgnorePatterns = [...BUILTIN_IGNORE_PATTERNS];
+  }
+  updateIgnoreDirectorySegments(cachedIgnorePatterns);
+  return cachedIgnorePatterns;
+}
+
+function normalizePatterns(patterns) {
+  return patterns
+    .map((pattern) => String(pattern).trim())
+    .filter((pattern) => pattern.length > 0);
+}
+
+function updateIgnoreDirectorySegments(patterns) {
+  const segments = new Set(['.git']);
+  patterns.forEach((pattern) => {
+    if (pattern.endsWith('/')) {
+      const segment = pattern.replace(/\/+$/, '');
+      if (segment) {
+        segments.add(segment);
+      }
+    }
+  });
+  ignoreDirectorySegments = segments;
+}
+
+function buildGitignoreContents(patterns) {
+  return `${patterns.join('\n')}\n`;
+}
+
 async function syncProject(projectPath) {
   const repoName = path.basename(projectPath);
-  console.log(`[${repoName}] Syncing...`);
+  console.log(`[${repoName}] Sync started`);
 
   await ensureGiteaRepository(repoName);
-  await ensureLocalGitRepo(projectPath);
+  const initialized = await ensureLocalGitRepo(projectPath);
+  if (initialized) {
+    await ensureDefaultGitignore(projectPath);
+  }
+  await removeNestedGitDirs(projectPath);
   await ensureGitIdentity(projectPath);
   await ensureRemote(projectPath, repoName);
+  await ensureFullHistory(projectPath);
 
   await stageAll(projectPath);
 
@@ -373,8 +638,8 @@ async function syncProject(projectPath) {
     await commitChanges(projectPath);
   }
 
-  await pushChanges(projectPath);
-  console.log(`[${repoName}] ${changesDetected ? 'Changes committed and pushed' : 'No changes'}`);
+  await pushChanges(projectPath, { pruneAfter: true });
+  console.log(`[${repoName}] Sync complete${changesDetected ? ' (changes pushed)' : ' (no changes)'}`);
 }
 
 async function ensureGiteaRepository(repoName) {
@@ -402,26 +667,67 @@ async function ensureLocalGitRepo(projectPath) {
     return false;
   } catch (error) {
     await runGit(projectPath, ['init', '-b', 'main']);
-    console.log(`[${path.basename(projectPath)}] Initialized git repository`);
+    console.log(`[${path.basename(projectPath)}] Initialised local git repository`);
     return true;
+  }
+  return false;
+}
+
+async function ensureDefaultGitignore(projectPath) {
+  const gitignorePath = path.join(projectPath, '.gitignore');
+  try {
+    await fs.access(gitignorePath);
+  } catch (error) {
+    const patterns = await getIgnorePatterns();
+    const contents = buildGitignoreContents(patterns);
+    await fs.writeFile(gitignorePath, contents);
+    console.log(`[${path.basename(projectPath)}] Added default .gitignore`);
+  }
+}
+
+async function removeNestedGitDirs(projectPath) {
+  let stdout = '';
+  try {
+    const result = await execFileAsync('find', [projectPath, '-mindepth', '2', '-type', 'd', '-name', '.git']);
+    stdout = result.stdout.trim();
+  } catch (error) {
+    if (error.stdout) {
+      stdout = error.stdout.trim();
+    }
+  }
+
+  if (!stdout) {
+    return;
+  }
+
+  const repoName = path.basename(projectPath);
+  const nestedPaths = stdout.split('\n').filter(Boolean);
+  for (const gitDir of nestedPaths) {
+    await fs.rm(gitDir, { recursive: true, force: true });
+    console.log(`[${repoName}] Removed nested git directory: ${gitDir}`);
   }
 }
 
 async function ensureGitIdentity(projectPath) {
+  const repoName = path.basename(projectPath);
   const authorName = process.env.GIT_AUTHOR_NAME || 'Gitea Autosync';
   const authorEmail = process.env.GIT_AUTHOR_EMAIL || 'autosync@example.com';
   await ensureGitConfig(projectPath, 'user.name', authorName);
   await ensureGitConfig(projectPath, 'user.email', authorEmail);
+  await ensureGitConfig(projectPath, 'commit.gpgsign', 'false');
+  await ensureGitConfig(projectPath, 'http.postBuffer', '524288000');
+  await ensureGitConfig(projectPath, 'http.maxRequestBuffer', '524288000');
+  console.log(`[${repoName}] Git identity ensured`);
 }
 
 async function ensureGitConfig(projectPath, key, value) {
   try {
     const { stdout } = await runGit(projectPath, ['config', '--get', key]);
-    if (stdout === value) {
+    if (stdout) {
       return;
     }
   } catch (error) {
-    // Config doesn't exist, set it
+    // ignore and set value
   }
   await runGit(projectPath, ['config', key, value]);
 }
@@ -432,9 +738,28 @@ async function ensureRemote(projectPath, repoName) {
     const { stdout } = await runGit(projectPath, ['remote', 'get-url', REMOTE_NAME]);
     if (stdout !== remoteUrl) {
       await runGit(projectPath, ['remote', 'set-url', REMOTE_NAME, remoteUrl]);
+      console.log(`[${repoName}] Updated remote URL`);
     }
   } catch (error) {
     await runGit(projectPath, ['remote', 'add', REMOTE_NAME, remoteUrl]);
+    console.log(`[${repoName}] Added remote ${REMOTE_NAME}`);
+  }
+}
+
+async function ensureFullHistory(projectPath) {
+  const repoName = path.basename(projectPath);
+  try {
+    const { stdout } = await runGit(projectPath, ['rev-parse', '--is-shallow-repository']);
+    if (stdout === 'true') {
+      try {
+        await runGit(projectPath, ['fetch', '--unshallow']);
+        console.log(`[${repoName}] Converted shallow clone to full history`);
+      } catch (error) {
+        console.warn(`[${repoName}] Warning: failed to unshallow repository (${error.message})`);
+      }
+    }
+  } catch (error) {
+    // ignore check failures
   }
 }
 
@@ -463,7 +788,7 @@ async function commitChanges(projectPath) {
   }
 }
 
-async function pushChanges(projectPath) {
+async function pushChanges(projectPath, { pruneAfter = false } = {}) {
   const branch = await currentBranch(projectPath);
   const hasUpstream = await branchHasUpstream(projectPath, branch);
 
@@ -479,15 +804,38 @@ async function pushChanges(projectPath) {
     : ['push', '--set-upstream', REMOTE_NAME, branch];
 
   try {
-    await runGit(projectPath, ['fetch', '--all'], { env: pushEnv });
     await runGit(projectPath, pushArgs, { env: pushEnv });
   } catch (error) {
     if (/non-fast-forward|fetch first|tip of your current branch is behind/.test(error.message)) {
-      await runGit(projectPath, ['pull', '--rebase', REMOTE_NAME, branch], { env: pushEnv });
-      await runGit(projectPath, pushArgs, { env: pushEnv });
+      console.warn(
+        `[${path.basename(projectPath)}] Remote ahead; forcing push so local repo stays authoritative.`
+      );
+      const forceArgs = hasUpstream
+        ? ['push', '--force-with-lease', REMOTE_NAME, branch]
+        : ['push', '--force', '--set-upstream', REMOTE_NAME, branch];
+      await runGit(projectPath, forceArgs, { env: pushEnv });
     } else {
       throw error;
     }
+  }
+
+  if (pruneAfter) {
+    await pruneRepository(projectPath);
+  }
+}
+
+
+async function pruneRepository(projectPath) {
+  const days = Number.isFinite(CONFIG.pruneAgeDays) ? CONFIG.pruneAgeDays : 0;
+  if (!days || days <= 0) return;
+  const repoName = path.basename(projectPath);
+  const pruneArg = `${days}.days`;
+  try {
+    await runGit(projectPath, ['reflog', 'expire', `--expire=${pruneArg}`, '--all']);
+    await runGit(projectPath, ['gc', `--prune=${pruneArg}`]);
+    console.log(`[${repoName}] Pruned git history older than ${days} day(s)`);
+  } catch (error) {
+    console.warn(`[${repoName}] Warning: git maintenance failed (${error.message})`);
   }
 }
 

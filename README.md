@@ -3,16 +3,18 @@
 Continuously mirror local project folders into any self-hosted Gitea instance.  
 Unofficial helper: not affiliated with the Gitea project.
 
-Simple automated backup: watches your project folders and automatically commits and pushes any changes to your Gitea server. Just set it and forget it.
+Keeps each top-level folder in sync with a private repo, auto-initialises Git, commits on change, and pushes via the Gitea API. Designed to be lightweight: set it once, let it handle scheduled and real-time snapshots.
 
 ## Features
 - Auto-discovers non-hidden directories under your project roots
-- Creates or reuses repos on Gitea automatically
-- **Respects each project's `.gitignore` files** - only commits files that Git tracks
-- Watches for filesystem changes and commits them automatically
-- Simple workflow: detects change → waits 5 seconds → commits all changes → pushes
-- Resource-efficient: typically uses <300MB RAM even with large project trees
-- `.gitignore` file monitoring - changes are automatically reloaded without restart
+- Creates or reuses repos on Gitea and seeds them with a sensible `.gitignore`
+- **Memory-optimized file watcher** with intelligent ignore patterns (regex-based filtering)
+- **Automatically respects project `.gitignore` files** - only watches files that will be synced
+- Watches for filesystem changes and ships "quick sync" commits within seconds
+- Strips nested `.git/` folders and adds a dedicated `gitea` remote per project
+- Keeps repositories **one-way synced**: pushes are forced when the remote gets ahead, so the local source of truth never pulls remote history back down
+- Optional maintenance: scheduled full syncs and Git history pruning
+- Resource-efficient: typically uses <512MB RAM even with large project trees
 
 ## Prerequisites
 - Node.js 18+ and Git
@@ -37,10 +39,10 @@ Set `GITEA_BASE_URL`, `GITEA_OWNER`, `GITEA_TOKEN`, and point `PROJECTS_ROOT` (a
 
 2) Run once or watch continuously
 ```bash
-# One-off snapshot of all projects
+# One-off snapshot
 pnpm run start
 
-# Watch mode - automatically commit and push changes as they happen
+# Watch mode (add SYNC_INTERVAL_MINUTES in .env for periodic full sweeps)
 pnpm run start:watch
 ```
 
@@ -50,75 +52,54 @@ pnpm run start:watch
 - `GITEA_OWNER`: user/org that will own mirrored repositories
 - `PROJECTS_ROOT`: primary directory; each subfolder becomes a repo
 - `PROJECTS_ADDITIONAL_ROOTS`: comma-separated extras; sibling `projects_archive` auto-added when present
-- `SYNC_DEBOUNCE_MS`: delay before committing changes (default 5000ms = 5 seconds)
+- `SYNC_INTERVAL_MINUTES`: schedule full syncs (0 to disable)
+- `SYNC_DEBOUNCE_MS`: delay before batching watch events (default 5000)
+- `SYNC_MAX_DEBOUNCE_MS`: hard cap for batching window—forces a sync at least once per interval even if edits never pause (default 60000)
+- `IGNORE_CONFIG_PATH`: JSON file with default `.gitignore` patterns
+- `PRUNE_AGE_DAYS`: enable Git garbage collection after full syncs
 - `GIT_AUTHOR_NAME` / `GIT_AUTHOR_EMAIL`: override commit identity
 
-## How It Works
-
-**Initial Sync:**
-On startup, autosync performs one full sync of all projects to catch any changes made while it was offline.
-
-**Watch Mode:**
-1. Detects file changes in your project directories
-2. Waits 5 seconds (debounce period) to group related changes
-3. Stages all changes with `git add --all`
-4. Commits with timestamp: "Auto backup 2025-11-03T12:34:56.789Z"
-5. Pushes to your Gitea server
-
-**What Gets Committed:**
-- Only files that Git would normally track
-- Respects each project's `.gitignore` file automatically
-- When a `.gitignore` is modified, patterns are reloaded instantly
-
-**What Gets Ignored:**
-- Anything in your project's `.gitignore`
-- `.git` directories
-- `node_modules` directories
-
 ## Usage notes
-- **Each project's `.gitignore` is automatically loaded and respected** - files ignored by Git won't be watched or committed.
-- Hidden directories (starting with `.`) are skipped automatically.
+- Default ignore patterns live in `ignoreconfig.json`; add your own or point `IGNORE_CONFIG_PATH` elsewhere.
+- **Each project's `.gitignore` is automatically loaded and respected** - files ignored by Git won't be watched.
+- Quick sync commits use descriptive timestamps; background full syncs reconcile everything.
+- Hidden directories are skipped automatically. Nested Git repos are flattened so only top-level folders push.
 - `.gitignore` files are monitored - changes are automatically reloaded without restart.
-- Commits use descriptive timestamps for easy identification.
-- If you delete a file, autosync will commit that deletion automatically.
 
 ## Performance Optimizations
-The file watcher is optimized for large project trees:
-- **Per-project `.gitignore` support**: Automatically loads and respects gitignore rules
-- **Efficient pattern matching**: Prevents scanning ignored directories
-- **Depth limiting**: Prevents excessive recursive scanning (max depth: 10)
+The file watcher is highly optimized for large project trees:
+- **Efficient ignore pattern matching**: Regex-based filtering prevents scanning ignored directories
+- **Per-project `.gitignore` support**: Automatically loads and respects gitignore rules for each project
+- **Depth limiting**: Prevents excessive recursive scanning (depth: 10)
 - **Stat-less operation**: Reduces memory by not tracking file metadata
+- **Resource limits**: Kubernetes deployment includes 512MB memory limit (typically uses 100-300MB)
 - **Smart debouncing**: Batches rapid file changes to avoid commit storms
 
-Typical RAM usage: 100-300MB even with large project trees.
+### Before vs After
+- **Before**: 4.67GB RAM usage watching 100k+ files (including ignored files)
+- **After**: <512MB RAM usage with intelligent filtering and .gitignore support
 
 ## Docker Compose
 Lightweight compose stack included:
 ```bash
-# First, configure your .env file
-cp .env.example .env
-# Edit .env and set:
-#   GITEA_BASE_URL, GITEA_TOKEN, GITEA_OWNER
-#   PROJECTS_ROOT (path to your main projects directory)
-#   PROJECTS_ADDITIONAL_ROOTS (path to additional directories, e.g., projects_archive)
-
-# Then build and run
 docker compose up -d --build
 ```
+Mount additional project paths and override any environment variable in `.env` or inline when you start the stack.
 
-The compose file automatically mounts `PROJECTS_ROOT` and `PROJECTS_ADDITIONAL_ROOTS` from your `.env` as volumes. Defaults to `/root/projects` and `/root/projects_archive` if not specified.
+## Kubernetes (Kustomize)
+`deploy/base` contains a minimal Deployment that installs Git, clones this repo, and runs watch mode. Provide:
+- ConfigMap/Secret (`giteaautosync-config` / `giteaautosync-secret`) with the same variables as `.env`
+- Secret `default-github-ssh` holding a deploy key plus `known_hosts`
+- Volumes for your project directories (update host paths or swap for PVCs)
+
+**Resource Requirements:**
+- Memory: 256Mi request / 512Mi limit (typically uses 100-300MB)
+- CPU: 100m request / 500m limit
 
 ## Troubleshooting
-- **Missing token?** The script exits with a helpful error. Double-check `.env`.
-- **Conflicts?** Autosync fetches/rebases before pushing; check logs if a repo still fails.
-- **Too many commits?** Increase `SYNC_DEBOUNCE_MS` to wait longer between commits (default 5000ms).
-- **Changes not being detected?** Make sure the files aren't in your project's `.gitignore`.
-
-## What Autosync Does NOT Do
-- Does not create or modify `.gitignore` files (respects your existing ones)
-- Does not remove nested `.git` directories (assumes you manage this)
-- Does not prune Git history or run garbage collection
-- Does not have scheduled full syncs (only on startup and when changes occur)
+- Missing token? The script exits with a helpful error. Double-check `.env`.
+- Conflicts? Autosync fetches/rebases before pushing; check logs if a repo still fails.
+- Slow builds? Raise `SYNC_DEBOUNCE_MS` to avoid repeated commits during large operations.
 
 ## License
 GPL-2.0-only — see `LICENSE`.
