@@ -5,16 +5,13 @@ WORKDIR /app
 # Install git (required for autosync)
 RUN apk add --no-cache git
 
-# Enable pnpm
-RUN corepack enable pnpm
-
 # Copy package files
-COPY package.json pnpm-lock.yaml ./
+COPY package.json package-lock.json* ./
 
 # Install dependencies
-RUN pnpm install --frozen-lockfile --prod
+RUN npm ci --omit=dev || npm install --omit=dev
 
 COPY . .
 
 ENV NODE_ENV=production
-CMD ["pnpm", "run", "start:watch"]
+CMD ["node", "index.js", "--watch"]
